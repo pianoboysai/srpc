@@ -6,7 +6,6 @@ import threading
 import cPickle, Queue, struct
 from optparse import OptionParser
 
-
 SRPC_FUNCCALL_TYPE=0
 SRPC_FUNCRETURN_TYPE=1
 SRPC_REQUEST_COMPLETION=2
@@ -43,31 +42,6 @@ def SRPCRecv(sock):
         data+=ret
     return  data
 
-class SRPCClientCall(object):
-    def __init__(self,client,protocol, funcname):
-        super(SRPCClientCall, self).__init__()
-        self.__funcname=funcname
-        self.__client=client
-        self.__protocol=protocol
-
-    def callfunc(self, *args, **kwargs):
-        ret=None
-        try:
-            data=self.__protocol.serialization([SRPC_FUNCCALL_TYPE, self.__funcname, args, kwargs])
-            SRPCSend(self.__client,data)
-            data=SRPCRecv(self.__client)
-            data=self.__protocol.deserialization(data)
-            if data[0]==SRPC_FUNCRETURN_TYPE:
-                ret=data[1]
-            elif data[0]==SRPC_REQUEST_ERROR:
-                print data[1]
-            
-        except Exception, err:
-            traceback.print_exc()
-            print err
-
-        return ret
-        
 class SRPCProtocol(object):
     def __init__(self):
         super(SRPCProtocol, self).__init__() 
@@ -76,39 +50,88 @@ class SRPCProtocol(object):
     def deserialization(self, data):
         return cPickle.loads(data) 
 
+SRPC_SHORT_CONNECT=0
+SRPC_LONG_CONNECT=1
+class SRPCClientCall(object):
+    def __init__(self,funcname, client):
+        super(SRPCClientCall, self).__init__()
+        self.client=client
+        self.funcname=funcname
+    def callfunc(self, *args, **kwargs):
+        return self.client.callfunc(self.funcname, *args, **kwargs)
+
 class SRPCClient(object):
-    def __init__(self,ip,port,socket_timeout=None, protocol=SRPCProtocol()):
+    def __init__(self,ip,port,socket_timeout=None, connect_mode=SRPC_SHORT_CONNECT, protocol=SRPCProtocol()):
         super(SRPCClient, self).__init__()
-        self.__protocol=protocol
-        self.__sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-        self.__sock.connect((ip,port))
-        self.__sock.settimeout(socket_timeout)
-        #print self.__sock.getsockname() 
-    
-    def __getattr__(self, funcname):
-        return SRPCClientCall(self.__sock,self.__protocol, funcname).callfunc
+        self.protocol=protocol
+        self.connect_mode=connect_mode
+        #print sock.getsockname() 
+        self.ipport=(ip,port)
+        self.socket_timeout=socket_timeout
+        if self.connect_mode==SRPC_LONG_CONNECT:
+            self.__collect()
     
     def __del__(self):
+        if self.connect_mode==SRPC_LONG_CONNECT:
+            self.__close(self.sock)
+
+    def __getattr__(self, funcname):
+        return SRPCClientCall(funcname, self).callfunc
+    
+    def __collect(self):
+        sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+        sock.connect(self.ipport)
+        sock.settimeout(self.socket_timeout)
+        self.sock=sock
+        
+    def __close(self, sock):
         try:
-            data=self.__protocol.serialization([SRPC_REQUEST_COMPLETION])
-            SRPCSend(self.__sock,data)
-            self.__sock.shutdown(socket.SHUT_RDWR)
+            if sock:
+                data=self.protocol.serialization([SRPC_REQUEST_COMPLETION])
+                SRPCSend(sock,data)
+                sock.shutdown(socket.SHUT_RDWR)
         except:
             traceback.print_exc()
+            
         try:
-            self.__sock.close()
+            if sock:
+                sock.close()
         except:
             traceback.print_exc()
+            
+    def callfunc(self, funcname, *args, **kwargs):
+        ret=None
+        try:
+            if self.connect_mode==SRPC_SHORT_CONNECT:
+                self.__collect()
+            
+            data=self.protocol.serialization([SRPC_FUNCCALL_TYPE, funcname, args, kwargs])
+            SRPCSend(self.sock,data)
+            data=SRPCRecv(self.sock)
+            data=self.protocol.deserialization(data)
+            if data[0]==SRPC_FUNCRETURN_TYPE:
+                ret=data[1]
+            elif data[0]==SRPC_REQUEST_ERROR:
+                print data[1]
+            
+            if self.connect_mode==SRPC_SHORT_CONNECT:
+                self.__close(self.sock)
+                
+        except Exception, err:
+            traceback.print_exc()
+            raise err
+
+        return ret
 
 class SRPCServer(object):
     def __init__(self, ip, port, timeout=None,protocol=SRPCProtocol()):
         super(SRPCServer, self).__init__()
         self.conn=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
         self.address=(ip,port)
-        self.__protocol=protocol
-        self.__method_dict={}
-        self.__method_dict['srpc_ListMethods']=self.srpc_ListMethods
-        self.__timeout=timeout
+        self.protocol=protocol
+        self.method_dict={}
+        self.method_dict['listMethods']=self.listMethods
+        self.timeout=timeout
         
     def __del__(self):
         self.conn.shutdown(socket.SHUT_RDWR)
@@ -119,11 +142,11 @@ class SRPCServer(object):
         try:
             while 1:
                 data=SRPCRecv(sock)
-                data=self.__protocol.deserialization(data)
+                data=self.protocol.deserialization(data)
                 #print data[0]
                 if data[0]==SRPC_FUNCCALL_TYPE:
                     funcname,args,kwargs=data[1:]
-                    func=self.__method_dict.get(funcname)
+                    func=self.method_dict.get(funcname)
                     if callable(func):
                         try:
                             ret=(SRPC_FUNCRETURN_TYPE, apply(func, args,kwargs))
@@ -137,28 +160,22 @@ class SRPCServer(object):
                 else:
                     ret = (SRPC_REQUEST_ERROR, "funcname '%s' has not been registered!" % funcname)
                 
-                data=self.__protocol.serialization(ret)
+                data=self.protocol.serialization(ret)
                 SRPCSend(sock,data)
 
-        except:
-            traceback.print_exc()
-
-        #print 'complete rpc from',addr
-        try:
             sock.shutdown(socket.SHUT_RDWR)
-        except:
-            traceback.print_exc()
-        try:
             sock.close()
-        except:
+        except Exception, err:
             traceback.print_exc()
+            print err
+            raise err
+            #traceback.print_exc()
 
-            
     def register_function(self,func):
         funcname=func.func_name
-        if self.__method_dict.get(funcname):
+        if self.method_dict.get(funcname):
             raise SRPCFuncnameRepetitiveError(funcname)
-        self.__method_dict[funcname]=func 
+        self.method_dict[funcname]=func 
 
     def register_instance(self,instance):
         l=dir(instance)
@@ -166,34 +183,54 @@ class SRPCServer(object):
             if not i.startswith('_'):
                 funcname=i
                 func=getattr(instance,funcname)
-                if self.__method_dict.get(funcname):
+                if self.method_dict.get(funcname):
                     raise SRPCFuncnameRepetitiveError
-                self.__method_dict[funcname]=func
-
-            
+                self.method_dict[funcname]=func
+  
     def exec_rpc_thread(self, sock, addr):
         t=threading.Thread(target=self.reply_rpc, args=(sock, addr))
         t.setDaemon(True)
         t.start()
         
-    def srpc_ListMethods(self):
-        return self.__method_dict.keys()
+    def listMethods(self):
+        return self.method_dict.keys()
 
     #return (0, 'success') or (-1,'fail reason')
-    def start_server(self):
+    def server_forever(self):
         self.conn.bind(self.address)
         self.conn.listen(20)
         print 'start server at', self.address
         while 1:
             try:
                 sock,address=self.conn.accept()
-                sock.settimeout(self.__timeout)
+                sock.settimeout(self.timeout)
                 self.exec_rpc_thread(sock, address)
             except:
                 print sys.exc_info()
                 sys.exit(0)
             finally:
                 pass
+
+class SRRPThreadPoolServer(SRPCServer):
+    def __init__(self, ip, port, timeout=None,protocol=SRPCProtocol(), init_threadnumber=30):
+        super(SRRPThreadPoolServer, self).__init__( ip, port, timeout,protocol)
+        self.init_threadnumber=init_threadnumber
+        self.queue=Queue.Queue()
+        self.threadlist=[]
+        for i in xrange(init_threadnumber):
+            t=threading.Thread(target=self.rpcthread)
+            t.setDaemon(True)
+            t.start()
+            self.threadlist.append(t)
+
+    def rpcthread(self):
+        print threading.currentThread().ident,'thread create' 
+        while 1:
+            sock, addr=self.queue.get()
+            self.reply_rpc(sock, addr)  
+            
+    def exec_rpc_thread(self, sock, addr):
+        self.queue.put((sock, addr))
 
 class SRPCServerExample(object):
     def __init__(self):
@@ -210,35 +247,36 @@ class Tester(object):
     def simulate_server(self):
         s=SRPCServer('127.0.0.1',22000)
         s.register_instance(SRPCServerExample())
-        s.start_server()
+        s.server_forever()
+    
+    def simulate_threadpool_server(self):
+        s=SRRPThreadPoolServer('127.0.0.1',22000)
+        s.register_instance(SRPCServerExample())
+        s.server_forever()
     
     def simulate_client(self):
-        return_queue=Queue.Queue()
         def client_call():
-            c=SRPCClient('127.0.0.1',22000)
-            t=time.time()
-            for i in xrange(100):
-                ret=c.ask('jack')
-            return_queue.put([ret, time.time()-t])
+            try:
+                c=SRPCClient('127.0.0.1',22000, 2)
+                print c.listMethods()
+                start_time=time.time()
+                for i in xrange(100):
+                    ret=c.ask('jack')
+                    print ret
+                print time.time()-start_time
+                c=SRPCClient('127.0.0.1',22000, 2, connect_mode=SRPC_LONG_CONNECT)
+                ret=c.ask('sai')
+                print ret
+            except Exception, err:
+                print err
         
-        st=time.time()
-        tl=[]
-        for i in xrange(1000):
+        for i in xrange(10):
             #client_call()
-            #continue
             t=threading.Thread(target=client_call)
+            #t.setDaemon(True)
             t.start()
-            tl.append(t)
-            
-        for i in tl:
-            i.join()
+        print 'over'
         
-        while 1:
-            if return_queue.empty():
-                break
-            return_queue.get()
-        print time.time()-st
-            
 def srpc_testfunc(name):
     return 'hello boy %s' % name
 
@@ -246,10 +284,14 @@ if __name__=='__main__':
     parser=OptionParser(version="0.1")
     parser.add_option('-c','--client',help='simulate client', action='store_true')
     parser.add_option('-s','--server',help='simulate server', action='store_true')
+    parser.add_option('-t','--threadpoolserver',help='simulate threadpool server', action='store_true')
     (opts,args)=parser.parse_args()
     if opts.server:
         a=Tester()
         a.simulate_server()
+    elif opts.threadpoolserver:
+        a=Tester()
+        a.simulate_threadpool_server()
     elif opts.client:
         a=Tester()
         a.simulate_client()
