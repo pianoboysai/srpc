@@ -42,13 +42,19 @@ def SRPCRecv(sock):
         data+=ret
     return  data
 
-class SRPCProtocol(object):
-    def __init__(self):
-        super(SRPCProtocol, self).__init__() 
+class SRPCDefaultProtocol(object):
     def serialization(self, data):
         return cPickle.dumps(data,0)
     def deserialization(self, data):
-        return cPickle.loads(data) 
+        return cPickle.loads(data)
+
+import json
+class SRPCJSONProtocol(object):
+    def serialization(self, data):
+        return json.dumps(data)
+    def deserialization(self, data):
+        s=json.loads(data)
+        return s
 
 SRPC_SHORT_CONNECT=0
 SRPC_LONG_CONNECT=1
@@ -61,7 +67,7 @@ class SRPCClientCall(object):
         return self.client.callfunc(self.funcname, *args, **kwargs)
 
 class SRPCClient(object):
-    def __init__(self,ip,port,socket_timeout=None, connect_mode=SRPC_SHORT_CONNECT, protocol=SRPCProtocol()):
+    def __init__(self,ip,port,socket_timeout=None, connect_mode=SRPC_SHORT_CONNECT, protocol=SRPCDefaultProtocol()):
         super(SRPCClient, self).__init__()
         self.protocol=protocol
         self.connect_mode=connect_mode
@@ -69,7 +75,7 @@ class SRPCClient(object):
         self.ipport=(ip,port)
         self.socket_timeout=socket_timeout
         if self.connect_mode==SRPC_LONG_CONNECT:
-            self.__collect()
+            self.__connect()
     
     def __del__(self):
         if self.connect_mode==SRPC_LONG_CONNECT:
@@ -78,7 +84,7 @@ class SRPCClient(object):
     def __getattr__(self, funcname):
         return SRPCClientCall(funcname, self).callfunc
     
-    def __collect(self):
+    def __connect(self):
         sock=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
         sock.connect(self.ipport)
         sock.settimeout(self.socket_timeout)
@@ -103,7 +109,7 @@ class SRPCClient(object):
         ret=None
         try:
             if self.connect_mode==SRPC_SHORT_CONNECT:
-                self.__collect()
+                self.__connect()
             
             data=self.protocol.serialization([SRPC_FUNCCALL_TYPE, funcname, args, kwargs])
             SRPCSend(self.sock,data)
@@ -124,7 +130,7 @@ class SRPCClient(object):
         return ret
 
 class SRPCServer(object):
-    def __init__(self, ip, port, timeout=None,protocol=SRPCProtocol()):
+    def __init__(self, ip, port, timeout=None,protocol=SRPCDefaultProtocol()):
         super(SRPCServer, self).__init__()
         self.conn=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
         self.address=(ip,port)
@@ -198,8 +204,7 @@ class SRPCServer(object):
     #return (0, 'success') or (-1,'fail reason')
     def server_forever(self):
         self.conn.bind(self.address)
-        self.conn.listen(20)
-        print 'start server at', self.address
+        self.conn.listen(100)
         while 1:
             try:
                 sock,address=self.conn.accept()
@@ -211,9 +216,9 @@ class SRPCServer(object):
             finally:
                 pass
 
-class SRRPThreadPoolServer(SRPCServer):
-    def __init__(self, ip, port, timeout=None,protocol=SRPCProtocol(), init_threadnumber=30):
-        super(SRRPThreadPoolServer, self).__init__( ip, port, timeout,protocol)
+class SRPCThreadPoolServer(SRPCServer):
+    def __init__(self, ip, port, timeout=None,protocol=SRPCDefaultProtocol(), init_threadnumber=30):
+        super(SRPCThreadPoolServer, self).__init__(ip, port, timeout,protocol)
         self.init_threadnumber=init_threadnumber
         self.queue=Queue.Queue()
         self.threadlist=[]
@@ -239,63 +244,86 @@ class SRPCServerExample(object):
         
     def ask(self, name):
         return 'hello %s! myname is %s' % (name, self.name)
+        
+def simulate_server(bindport,threadnumber,protocol):
+    if threadnumber:
+        print 'start threadpool server',bindport
+        s=SRPCThreadPoolServer('127.0.0.1',bindport, protocol=protocol,init_threadnumber=threadnumber)
+    else:
+        print 'start server',bindport
+        s=SRPCServer('127.0.0.1',bindport,protocol=protocol)
+    s.register_instance(SRPCServerExample())
+    s.server_forever()
+    
+    
+def simulate_client(bindport,number,protocol,mode,debug):
+    c=SRPCClient('127.0.0.1', bindport, protocol=protocol,connect_mode=mode)
+    if debug:
+        print c.listMethods()
 
-class Tester(object):
-    def __init__(self):
-        super(Tester, self).__init__()
+    for i in xrange(number):
+        ret=c.ask('jack')
+        if debug:
+            print ret
         
-    def simulate_server(self):
-        s=SRPCServer('127.0.0.1',22000)
-        s.register_instance(SRPCServerExample())
-        s.server_forever()
+def find_idle_port():
+    import random
+    while 1:
+        port=random.randint(20000,60000) 
+        a=os.popen('netstat -an|grep ":%d"' % port).read()
+        if not a:
+           return port 
+
+g_bindport=find_idle_port()
+def main():
+    global g_bindport
+    parser=OptionParser(version="0.1")
+    parser.add_option('-p','--protocol',default='',help='json is optional',metavar='json')
+    parser.add_option('-t','--threadnumber',help='use threadpool server, 0 is default server', type=int, default=0, metavar='10')
+    parser.add_option('-c','--client',help='client number', type=int, default=1, metavar=10)
+    parser.add_option('-n','--number',help='every client request number', type=int, default=100, metavar=100)
+    parser.add_option('-m','--mode',help='connection mode, 0:long | 1:short', type=int, default=0, metavar=0)
+    parser.add_option('-d','--debug',help='', action='store_true')
+    parser.add_option('-r','--remoteport',help='only launch client to connect port', type=int, default=0, metavar=0)
+    (opts,args)=parser.parse_args()
+    print opts
+    if opts.protocol=='json':
+        protocol=SRPCJSONProtocol()
+    else:
+        protocol=SRPCDefaultProtocol()
+    print protocol
+    threadnumber=opts.threadnumber
+    clientnumber=opts.client 
+    number=opts.number
+    mode=opts.mode
+    remoteport=opts.remoteport
+
+    if mode==0:
+        mode=SRPC_LONG_CONNECT
+    else:
+        mode=SRPC_SHORT_CONNECT
+    debug=opts.debug
+    if not remoteport:
+        th=threading.Thread(target=simulate_server,args=(g_bindport,threadnumber,protocol))
+        th.setDaemon(True)
+        th.start()
+        time.sleep(0.1)
+    else:
+        g_bindport=remoteport
+
+    t=time.time()
+    l=[]
+    for i in xrange(clientnumber):
+        th=threading.Thread(target=simulate_client,args=(g_bindport,number,protocol,mode,debug))
+        th.start()
+        l.append(th)
+    for th in l:
+        th.join()
     
-    def simulate_threadpool_server(self):
-        s=SRRPThreadPoolServer('127.0.0.1',22000)
-        s.register_instance(SRPCServerExample())
-        s.server_forever()
-    
-    def simulate_client(self):
-        def client_call():
-            try:
-                c=SRPCClient('127.0.0.1',22000, 2)
-                print c.listMethods()
-                start_time=time.time()
-                for i in xrange(100):
-                    ret=c.ask('jack')
-                    print ret
-                print time.time()-start_time
-                c=SRPCClient('127.0.0.1',22000, 2, connect_mode=SRPC_LONG_CONNECT)
-                ret=c.ask('sai')
-                print ret
-            except Exception, err:
-                print err
+    print time.time()-t
         
-        for i in xrange(10):
-            #client_call()
-            t=threading.Thread(target=client_call)
-            #t.setDaemon(True)
-            t.start()
-        print 'over'
-        
-def srpc_testfunc(name):
-    return 'hello boy %s' % name
 
 if __name__=='__main__':
-    parser=OptionParser(version="0.1")
-    parser.add_option('-c','--client',help='simulate client', action='store_true')
-    parser.add_option('-s','--server',help='simulate server', action='store_true')
-    parser.add_option('-t','--threadpoolserver',help='simulate threadpool server', action='store_true')
-    (opts,args)=parser.parse_args()
-    if opts.server:
-        a=Tester()
-        a.simulate_server()
-    elif opts.threadpoolserver:
-        a=Tester()
-        a.simulate_threadpool_server()
-    elif opts.client:
-        a=Tester()
-        a.simulate_client()
-    else:
-        parser.print_help()
+    main()
 
 

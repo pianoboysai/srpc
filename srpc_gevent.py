@@ -13,9 +13,15 @@ class SRPCGEventServer(SRPCServer):
     def exec_rpc_thread(self, sock, address):
         job=gevent.spawn(self.reply_rpc,sock,address)
 
-if __name__=='__main__':
-    s=SRPCGEventServer('127.0.0.1',22000)
+g_bindport=find_idle_port()
+def main():
+    print 'start gevent server',g_bindport
+    s=SRPCGEventServer('127.0.0.1',g_bindport)
     s.register_instance(SRPCServerExample())
-    s.start_server() 
+    s.server_forever() 
+
+if __name__=='__main__':
+    main() 
+
 
 
