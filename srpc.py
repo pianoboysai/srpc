@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*
 # author: SAI
 import os, sys, time, socket, traceback
-import threading
-import cPickle, Queue, struct
+import threading, json, cPickle, Queue, struct
 from optparse import OptionParser
 
 SRPC_FUNCCALL_TYPE=0
@@ -11,6 +10,9 @@ SRPC_FUNCRETURN_TYPE=1
 SRPC_REQUEST_COMPLETION=2
 SRPC_REQUEST_ERROR=-1
 SRPC_SOCKET_BUFFER_SIZE = 4096
+
+class SRPCException(Exception):
+    pass
 
 class SRPCFuncnameRepetitiveError(Exception):
     def __init__(self, funcname):
@@ -24,7 +26,7 @@ def SRPCSend(sock, data):
     if not data:
         data=''
     sendsize=len(data)
-    sock.sendall(struct.pack('I',sendsize)+data)#这里不要分开写成两次sendall，不然第2次还得等第一次发完才继续
+    sock.sendall(struct.pack('I',sendsize)+data)
     return
 
 #return data
@@ -48,7 +50,6 @@ class SRPCDefaultProtocol(object):
     def deserialization(self, data):
         return cPickle.loads(data)
 
-import json
 class SRPCJSONProtocol(object):
     def serialization(self, data):
         return json.dumps(data)
@@ -107,10 +108,10 @@ class SRPCClient(object):
             
     def callfunc(self, funcname, *args, **kwargs):
         ret=None
+        if self.connect_mode==SRPC_SHORT_CONNECT:
+            self.__connect()
+        
         try:
-            if self.connect_mode==SRPC_SHORT_CONNECT:
-                self.__connect()
-            
             data=self.protocol.serialization([SRPC_FUNCCALL_TYPE, funcname, args, kwargs])
             SRPCSend(self.sock,data)
             data=SRPCRecv(self.sock)
@@ -118,14 +119,12 @@ class SRPCClient(object):
             if data[0]==SRPC_FUNCRETURN_TYPE:
                 ret=data[1]
             elif data[0]==SRPC_REQUEST_ERROR:
-                print data[1]
-            
+                raise SRPCException(data[1])
+            else:
+                raise SRPCException('unknown')
+        finally:
             if self.connect_mode==SRPC_SHORT_CONNECT:
                 self.__close(self.sock)
-                
-        except Exception, err:
-            traceback.print_exc()
-            raise err
 
         return ret
 
@@ -164,7 +163,7 @@ class SRPCServer(object):
                 elif data[0]==SRPC_REQUEST_COMPLETION:
                     break
                 else:
-                    ret = (SRPC_REQUEST_ERROR, "funcname '%s' has not been registered!" % funcname)
+                    ret=(SRPC_REQUEST_ERROR, "funcname '%s' has not been registered!" % funcname)
                 
                 data=self.protocol.serialization(ret)
                 SRPCSend(sock,data)
@@ -247,10 +246,10 @@ class SRPCServerExample(object):
         
 def simulate_server(bindport,threadnumber,protocol):
     if threadnumber:
-        print 'start threadpool server',bindport
+        print 'start threadpool server, port:',bindport
         s=SRPCThreadPoolServer('127.0.0.1',bindport, protocol=protocol,init_threadnumber=threadnumber)
     else:
-        print 'start server',bindport
+        print 'start server, port:',bindport
         s=SRPCServer('127.0.0.1',bindport,protocol=protocol)
     s.register_instance(SRPCServerExample())
     s.server_forever()
@@ -277,10 +276,10 @@ def find_idle_port():
 g_bindport=find_idle_port()
 def main():
     global g_bindport
-    parser=OptionParser(version="0.1")
+    parser=OptionParser()
     parser.add_option('-p','--protocol',default='',help='json is optional',metavar='json')
-    parser.add_option('-t','--threadnumber',help='use threadpool server, 0 is default server', type=int, default=0, metavar='10')
-    parser.add_option('-c','--client',help='client number', type=int, default=1, metavar=10)
+    parser.add_option('-t','--threadnumber',help='use threadpool server, 0 is default server', type=int, default=0, metavar='0')
+    parser.add_option('-c','--client',help='client number', type=int, default=1, metavar=1)
     parser.add_option('-n','--number',help='every client request number', type=int, default=100, metavar=100)
     parser.add_option('-m','--mode',help='connection mode, 0:long | 1:short', type=int, default=0, metavar=0)
     parser.add_option('-d','--debug',help='', action='store_true')
@@ -291,7 +290,6 @@ def main():
         protocol=SRPCJSONProtocol()
     else:
         protocol=SRPCDefaultProtocol()
-    print protocol
     threadnumber=opts.threadnumber
     clientnumber=opts.client 
     number=opts.number
